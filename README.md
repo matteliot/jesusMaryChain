@@ -38,6 +38,11 @@ strings.
 | Honey | light yellow | beige |
 | Psychocandy | magenta | red |
 
+## Install
+
+Download [`release/jesusmarychain.endl`](release/jesusmarychain.endl) (on GitHub: open it and click the download button), connect the Endless
+to your computer over USB and copy the file onto the pedal. Nothing needs to be built. To rebuild it from source, see below.
+
 ## Build
 
 ```sh
