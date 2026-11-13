@@ -96,7 +96,7 @@ struct Comb<const N: usize> {
 }
 
 impl<const N: usize> Comb<N> {
-    const NEW: Self = Self { buf: [0.0; N], len: N, i: 0, filt: 0.0 };
+    const NEW: Self = Self { buf: [0.0; N], len: 0, i: 0, filt: 0.0 };
 
     #[inline]
     fn process(&mut self, x: f32, fb: f32, damp: f32) -> f32 {
@@ -119,7 +119,7 @@ struct Allpass<const N: usize> {
 }
 
 impl<const N: usize> Allpass<N> {
-    const NEW: Self = Self { buf: [0.0; N], len: N, i: 0 };
+    const NEW: Self = Self { buf: [0.0; N], len: 0, i: 0 };
 
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
@@ -191,6 +191,17 @@ impl Reverb {
 
 // ---------------------------------------------------------------- state
 
+/// The delay lines. They are all zero at rest, so they live in .bss and add
+/// nothing to the patch file; `patch_init` zeroes them before use.
+struct Bufs {
+    fb_line: Delay<512>,
+    rev: Reverb,
+}
+
+impl Bufs {
+    const NEW: Self = Self { fb_line: Delay::NEW, rev: Reverb::NEW };
+}
+
 struct Jm {
     ready: bool,
     error: bool,
@@ -230,12 +241,9 @@ struct Jm {
     gate_open: bool,
     comp: f32,
     // feedback loop
-    fb_line: Delay<512>,
     fb_ph_a: f32,
     fb_ph_b: f32,
     fb_count: u32,
-    // reverb
-    rev: Reverb,
     // coefficients
     c_param: f32,
     c_mix: f32,
@@ -283,11 +291,9 @@ impl Jm {
         gate: 0.0,
         gate_open: false,
         comp: 1.0,
-        fb_line: Delay::NEW,
         fb_ph_a: 0.0,
         fb_ph_b: 0.4,
         fb_count: 0,
-        rev: Reverb::NEW,
         c_param: 1.0,
         c_mix: 1.0,
         c_att: 1.0,
@@ -299,7 +305,7 @@ impl Jm {
         c_fb_down: 1.0,
     };
 
-    fn init(&mut self) {
+    fn init(&mut self, b: &mut Bufs) {
         self.hp_in.highpass(80.0, 0.707);
         // Psychocandy: thin and trebly into the fuzz, nothing below ~140 Hz.
         self.fz_hp.highpass(140.0, 0.707);
@@ -322,7 +328,7 @@ impl Jm {
         self.cab[4].lowpass(7000.0, 0.7);
         self.cab[5].lowpass(10_000.0, 0.6);
         self.fb_bp.bandpass(FB_FREQ, FB_Q);
-        self.rev.init();
+        b.rev.init();
         self.c_param = coef(0.02);
         self.c_mix = coef(0.012);
         self.c_att = coef(0.001);
@@ -378,7 +384,7 @@ impl Jm {
     }
 
     #[inline]
-    fn tick(&mut self, x: f32) -> (f32, f32) {
+    fn tick(&mut self, b: &mut Bufs, x: f32) -> (f32, f32) {
         self.g_fuzz += (self.g_fuzz_t - self.g_fuzz) * self.c_param;
         self.out_g += (self.out_t - self.out_g) * self.c_param;
         self.rev_s += (self.reverb - self.rev_s) * self.c_param;
@@ -418,12 +424,12 @@ impl Jm {
         }
         let ft = if self.feedback && self.loud && self.gate_open { 1.0 } else { 0.0 };
         self.fb_ramp += (ft - self.fb_ramp) * if ft > self.fb_ramp { self.c_fb_up } else { self.c_fb_down };
-        let fb = self.fb_line.read(FB_DELAY) * self.fb_ramp * FB_LOOP / self.g_fuzz;
+        let fb = b.fb_line.read(FB_DELAY) * self.fb_ramp * FB_LOOP / self.g_fuzz;
         let duck = 1.0 - FB_DUCK * self.fb_ramp;
 
         // Both voices always run, so switching is a click-free crossfade.
         let d = self.fuzz(x * duck + fb) * self.gate;
-        self.fb_line.push(self.fb_bp.process(d));
+        b.fb_line.push(self.fb_bp.process(d));
         let c = self.clean(x) * db(HONEY_LEVEL_DB + CLEAN_MAKEUP_DB);
         let m = self.mix;
         let mut y = c + (d - c) * m;
@@ -433,7 +439,7 @@ impl Jm {
 
         // Shared reverb, so its tail carries across a switch.
         let room = ROOM_MIN + ROOM_RANGE * self.rev_s;
-        let (wl, wr) = self.rev.process(y, room);
+        let (wl, wr) = b.rev.process(y, room);
         let wet = self.rev_s * (HONEY_WET + (PSYCHO_WET - HONEY_WET) * m);
         (limit((y + wet * wl) * self.out_g), limit((y + wet * wr) * self.out_g))
     }
@@ -473,14 +479,30 @@ fn limit(x: f32) -> f32 {
 
 /// All patch state. The firmware calls every entry point from the audio
 /// thread (SDK: "no need to synchronize").
-struct Global(UnsafeCell<Jm>);
-unsafe impl Sync for Global {}
-static STATE: Global = Global(UnsafeCell::new(Jm::NEW));
+struct Global<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for Global<T> {}
+static STATE: Global<Jm> = Global(UnsafeCell::new(Jm::NEW));
+static BUFS: Global<Bufs> = Global(UnsafeCell::new(Bufs::NEW));
 
 #[allow(clippy::mut_from_ref)]
 fn state() -> &'static mut Jm {
     // SAFETY: single-threaded access from the firmware's audio thread.
     unsafe { &mut *STATE.0.get() }
+}
+
+#[allow(clippy::mut_from_ref)]
+fn bufs() -> &'static mut Bufs {
+    // SAFETY: as `state`.
+    unsafe { &mut *BUFS.0.get() }
+}
+
+/// Zeroes the delay lines in place. The loader should already have cleared
+/// .bss, but nothing promises it, and a NaN left in a feedback loop never
+/// decays. (In place: a zeroed copy would be a large stack temporary.)
+fn clear_bufs() {
+    // SAFETY: `Bufs` is only f32 and usize fields, so all-zero bits are a
+    // valid value; single-threaded as `state`.
+    unsafe { core::ptr::write_bytes(BUFS.0.get(), 0, 1) }
 }
 
 // ---------------------------------------------------------------- entry points
@@ -493,7 +515,8 @@ unsafe extern "C" fn patch_init(env: *const PatchEnv) {
     if env.is_null() || unsafe { (*env).abi_version } != PATCH_ABI_VERSION as u32 {
         return;
     }
-    state().init();
+    clear_bufs();
+    state().init(bufs());
 }
 
 unsafe extern "C" fn update_buffers(_: *const PatchEnv, left: *mut f32, right: *mut f32, samples: i32) -> f32 {
@@ -503,12 +526,12 @@ unsafe extern "C" fn update_buffers(_: *const PatchEnv, left: *mut f32, right: *
     }
     // SAFETY: the firmware passes two buffers of `samples` floats.
     let (l, r) = unsafe { (core::slice::from_raw_parts_mut(left, n), core::slice::from_raw_parts_mut(right, n)) };
-    let s = state();
+    let (s, bf) = (state(), bufs());
     if !s.ready {
         return 0.0;
     }
     for (a, b) in l.iter_mut().zip(r.iter_mut()) {
-        let (ol, or) = s.tick(*a);
+        let (ol, or) = s.tick(bf, *a);
         *a = ol;
         *b = or;
     }
