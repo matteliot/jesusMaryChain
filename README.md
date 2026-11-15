@@ -60,8 +60,14 @@ cargo sim                    # -> target/render/jesusmarychain_demo.wav
 ```
 
 This renders an original I–vi–IV–V progression in G at 126 bpm on a modelled
-electric guitar (`src/guitar.rs`). It plays Honey (one ringing strum per beat),
+electric guitar (`src/pedalkit/guitar.rs`). It plays Honey (one ringing strum per beat),
 then Psychocandy (eighth-note down/up strums). Then it arms the squall: a held G
 screeches, the progression plays over it, a final D howls, and the strings are
 muted into the reverb tail. Then it prints the level and stereo width of each
 section.
+
+## Code layout
+
+- `src/jesus_mary_chain/`: the pedal. `patch.rs` wires it up, `presets.rs` holds every number, and the other files are its blocks.
+- `src/pedalkit/`: shared building blocks (effects, DSP, the Endless ABI, the entry points, the demo renderer). It's a copy of the master in [superPedal](https://github.com/matteliot/superPedal), which also carries this pedal, so don't edit it here.
+- `src/host/`: the `cargo sim` demo (`score.rs` is what it plays).
